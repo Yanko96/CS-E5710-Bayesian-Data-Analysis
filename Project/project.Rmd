@@ -1,0 +1,1275 @@
+---
+title: "Bayesian Data Analysis Project Report"
+output:
+  pdf_document: 
+    toc: yes
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(aaltobda)
+library(GGally)
+library(StanHeaders)
+library(rstan)
+library(loo)
+library(datasets)
+library(leaps)
+library("gridExtra")
+library("bayesplot")
+```
+\newpage
+
+# Introduction
+
+We use a dataset called Motor Trend Car Road Tests. The data was extracted from the 1974 Motor Trend US magazine, and comprises fuel consumption and 10 aspects of automobile design and performance for 32 automobiles (1973--74 models). Details of the dataset are discussed below. And here's a overview of the whole structure of this report. 
+
+- Overview of the dataset 
+- Data Exploration and Analysis Problem
+- Model Formulation
+- Model diagnostics and results
+- Conclusion & Discussion
+
+# Overview of the dataset  
+The dataset consists of 32 cars, for which the following information has been recorded:
+
+- Miles per gallon  (a measure of fuel consumption)
+- Number of cylinders
+- Displacement (the total volume of the cylinders)
+- Gross horsepower
+- Rear axle ratio (related to towing capabilities)
+- Weight
+- Quarter mile time (how fast the car can traverse a quarter mile)
+- Shape of the engine - straight vs V-shaped
+- Transmission  - automatic vs manual
+- Number of forward gears
+- Number of carburetors
+
+We can see that it's pretty natural to study how car design can affect the 1/4 mile time, in other words, the performance of the car. From the information the dataset provided, it seems confusing because many of them are correlated, like displacement and horsepower. Because Engine displacement and horsepower of the engine (without any power boosters) are linearly proportional that a engine having swept volume of 14cc to 17cc will produce the power of 1hp. So how to choose the variables of our model? Let's first do the unit conversion and make some plots to explore the data further. 
+
+
+# Data Exploration and Analysis Problem
+## Data Preprocessing and Data Exploration
+We would like to first convert data in imperial units to data in metric units for easier interpretation. 
+- fuel consumption: From \textit{Miles per US gallon} to \textit{Litres per 100 km}
+- Weight: From \textit{pound} to \textit{ton}
+- Displacement: From \textit{inch} to \textit{litre}
+
+```{r}
+car_properties <- data.frame(lphkm = 235.215/mtcars$mpg,
+                             cyl = mtcars$cyl,
+                             disp = mtcars$disp/61.024,
+                             hp = mtcars$hp,
+                             drat = mtcars$drat,
+                             wt = mtcars$wt/2.205,
+                             qsec = mtcars$qsec,
+                             vs = mtcars$vs,
+                             am = mtcars$am,
+                             gear = mtcars$gear,
+                             carb = mtcars$carb)
+```
+
+Then we can plot each pair of the variables in a matrix and see what we can get.
+
+```{r}
+# Make a copy for correct plotting
+plotcars <- car_properties
+# Change default plots styled for the lower triangular of the plot matrix
+lower <- list(continuous = "smooth",
+                combo = "facetdensity")
+ggpairs(plotcars,
+        lower = lower,
+        showStrips = TRUE,
+        progress = FALSE,
+        title = "Data Exploration") +
+  theme_bw()
+
+```
+
+First, we can notice that relationships of some pairs are already linear, which can be a desirable property. Then from the correlation measures, we can see that horsepower and displacement do have high correlation as we speculated above, and as for the 1/4 mile time, shape of the engine, horsepower, number of carburetors, number of cylinders and displacement are all highly correlated with it. But since they are all measures of engine, can we use only a few of them as some of the variables in our model?   
+However, counterintuitively, we also notice that car weight and transmission type (as automation transmission could optimize the performance) do not have relatively hugh impacts on car performance.    
+Consequently, we now have the variable that we're interested in based on our prior information about which parts can affect a car's performance: horsepower, number of carburetors, car weight, transmission type and shape of the engine.  
+
+
+```{r}
+#Do a best subset selection for linear regression models trying out all possible combination
+car.sum <- summary(regsubsets(qsec ~., data = plotcars))
+car.sum$which[which.min(car.sum$bic), 2:11]
+```
+
+
+But here's another question, the best subset selected by the \textit{regsubsets} function is quite different from our model, which of these 2 models performs the best speaking of predicting 1/4 mile time? What if we include all variables in the Bayesian linear regression model?    
+
+Therefore, we've already had 3 models in mind for comparison. We will formally formulate our analysis problem in the next section. 
+
+## Analysis Problem Defining
+Let's summarize the problem and the chosen variables we have come up with so far.   
+- Analysis Problem: What are the best variables that can be used to predict car performance?
+- Variables: For multivariate model 1, horsepower, number of carburetors, car weight, transmission type and shape of the engine are the variables $X$. For multivariate model 2, displacement, car weight, shape of the engine, number of carburetors would be used as variables $X$. And for multivariate model 3, all variables will be used. 
+## Model Formulation
+Since there's no clear need for non-linearity as stated above, we can use bayesian linear regression, i.e., 
+$$y \sim N(\alpha + \beta X,\, \sigma^2)$$
+where $y$ is 1/4 mile time, $X$ is the matrix of predictor variables and $\alpha, \beta$ are the intercept and regression coefficients, respectively.
+
+We will try the univariate linear regression and the multivariate linear regression to check the dependencies. Normal linear regression captures the dependencies between predictors and responses. We will then choose the best model and continue with the analysis. 
+
+### Priors
+
+We use weakly informative priors. The weakly informative priors are useful because they provide some information on the relative a priori plausibility of the possible parameter values. They also help to reduce posterior uncertainty and stabilize computations. The prior for $\alpha$ is a Cauchy distribution with center 0 and scale 10. As priors for the regression coefficients $\beta$ we use a Student's t distribution with 3 degrees of freedom, location 0 and scale 2. For the standard deviation of the posterior distribution, $\sigma$ we use a half-normal (0, 10) distribution. 
+
+The rule of thumb for weakly informative distributions is that the standard deviation of the posterior distribution should be less than 0.1 times that of the prior. The scales of the priors were chosen so that this rule is respected. To do this, we need to calculate the standard deviation of the prior. For a t-distribution with scale $s$ and $\nu$ degrees of freedom, the standard deviation is:
+$$\sqrt{s^2\cdot \frac{\nu}{\nu -2}} = \sqrt{2^2 * \frac{3}{3-2}} = 2\cdot\sqrt{3} \approx 3.46$$
+For a Cauchy distribution, the standard deviation is not defined, and for the normal prior of $\sigma$ we use standard deviation of 10.
+
+Then we would like to normalize all data into the range [0,1] except for engine type and transmission type as they are already in the range [0,1], which can benifit us a lot in the sense that if we are dealing with unit variables in the later section of model formulation, it's much easier for both interpretation and prior distribution selection of the regression coefficients. 
+```{r}
+# scale numeric variables
+scaled_car_properties<-car_properties
+for (i in seq(from=1,to=length(car_properties)))
+  scaled_car_properties[i]<-scale(scaled_car_properties[i])
+```
+
+### separate linear Modeling
+```{r}
+stan_separate_model = '
+data {
+  int<lower=0> N; 
+  vector[N] x;
+  vector[N] y; 
+}
+parameters {
+  real alpha;           
+  real beta;            
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[N] mu;
+  mu = alpha + beta*x;
+}
+model {
+  alpha ~ cauchy(0,10);
+  beta ~ student_t(3,0,2);
+  sigma ~ normal(0, 10);
+  y ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[N] log_lik;
+  for (i in 1:N)
+    log_lik[i] = normal_lpdf(y[i] |alpha+x[i]*beta , sigma);
+}
+'
+
+fit_lphkm = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$lphkm),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_lphkm, probs = c(0.1, 0.5, 0.9))
+
+fit_cyl = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$cyl),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_cyl, probs = c(0.1, 0.5, 0.9))
+
+fit_disp = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$disp),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_disp, probs = c(0.1, 0.5, 0.9))
+
+fit_hp = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$hp),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_hp, probs = c(0.1, 0.5, 0.9))
+
+fit_drat = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$drat),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_drat, probs = c(0.1, 0.5, 0.9))
+
+fit_wt = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$wt),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_wt, probs = c(0.1, 0.5, 0.9))
+
+fit_vs = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$vs),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_vs, probs = c(0.1, 0.5, 0.9))
+
+fit_am = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$am),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_am, probs = c(0.1, 0.5, 0.9))
+
+fit_gear = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$gear),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_gear, probs = c(0.1, 0.5, 0.9))
+
+fit_carb = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$carb),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model,refresh=0)
+monitor(fit_carb, probs = c(0.1, 0.5, 0.9))
+
+```
+
+### Multivariate linear modeling
+```{r}
+stan_nlin_model1 = '
+data {
+  int<lower=0> n; 
+  vector[n] hp;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] am;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_hp;
+  real beta_wt;
+  real beta_vs;
+  real beta_am;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_hp*hp + beta_wt*wt + beta_vs*vs + 
+       beta_am*am + beta_carb*carb;
+}
+model {
+  alpha ~ cauchy(0,10);
+  beta_wt ~ student_t(3,0,2);
+  beta_hp ~ student_t(3,0,2);
+  beta_am ~ student_t(3,0,2);
+  beta_vs ~ student_t(3,0,2);
+  beta_carb ~ student_t(3,0,2);
+  sigma ~ normal(0, 10);
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlin1 = stan(data = list(n=length(scaled_car_properties$hp),
+                 hp=c(scaled_car_properties$hp),
+                 wt=c(scaled_car_properties$wt),
+                 vs=c(scaled_car_properties$vs),
+                 am=c(scaled_car_properties$am),
+                 carb=c(scaled_car_properties$carb),
+                 qsec=c(scaled_car_properties$qsec)), 
+                  model_code = stan_nlin_model1,refresh=0)
+
+monitor(fit_nlin1, probs = c(0.1, 0.5, 0.9))
+```
+```{r}
+stan_nlin_model2 = '
+data {
+  int<lower=0> n; 
+  vector[n] disp;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_disp;
+  real beta_wt;
+  real beta_vs;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_disp*disp + beta_wt*wt + beta_vs*vs + beta_carb*carb;
+}
+model {
+  alpha ~ cauchy(0,10);
+  beta_disp ~ student_t(3,0,2);
+  beta_wt ~ student_t(3,0,2);
+  beta_vs ~ student_t(3,0,2);
+  beta_carb ~ student_t(3,0,2);
+  sigma ~ normal(0, 10);
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlin2 = stan(data = list(n=length(scaled_car_properties$hp),
+                 disp=c(scaled_car_properties$disp),
+                 wt=c(scaled_car_properties$wt),
+                 vs=c(scaled_car_properties$vs),
+                 carb=c(scaled_car_properties$carb),
+                 qsec=c(scaled_car_properties$qsec)), 
+                  model_code = stan_nlin_model2,refresh=0)
+
+monitor(fit_nlin2, probs = c(0.1, 0.5, 0.9))
+```
+
+
+```{r}
+stan_nlin_model3 = '
+data {
+  int<lower=0> n; 
+  vector[n] lphkm;
+  vector[n] cyl;
+  vector[n] disp;
+  vector[n] hp;
+  vector[n] drat;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] am;
+  vector[n] gear;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_lphkm;
+  real beta_cyl;
+  real beta_disp;
+  real beta_hp;
+  real beta_drat;
+  real beta_wt;
+  real beta_vs;
+  real beta_am;
+  real beta_gear;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_lphkm*lphkm + beta_cyl* cyl + beta_disp * disp + 
+  beta_hp*hp + beta_drat* drat + beta_wt*wt + beta_vs*vs + 
+  beta_am*am + beta_gear*gear + beta_carb*carb;
+}
+model {
+  alpha ~ cauchy(0,10);
+  beta_lphkm ~ student_t(3,0,2);
+  beta_cyl ~ student_t(3,0,2);
+  beta_hp ~ student_t(3,0,2);
+  beta_drat ~ student_t(3,0,2);
+  beta_wt ~ student_t(3,0,2);
+  beta_am ~ student_t(3,0,2);
+  beta_vs ~ student_t(3,0,2);
+  beta_gear ~ student_t(3,0,2);
+  beta_carb ~ student_t(3,0,2);
+  sigma ~ normal(0, 10);
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlin3 = stan(data = list(n=length(scaled_car_properties$hp),
+                             lphkm=c(scaled_car_properties$lphkm),
+                             cyl=c(scaled_car_properties$cyl),
+                             disp=c(scaled_car_properties$disp),
+                             hp=c(scaled_car_properties$hp),
+                             drat=c(scaled_car_properties$drat),
+                             wt=c(scaled_car_properties$wt),
+                             vs=c(scaled_car_properties$vs),
+                             am=c(scaled_car_properties$am),
+                             gear=c(scaled_car_properties$gear),
+                             carb=c(scaled_car_properties$carb),
+                             qsec=c(scaled_car_properties$qsec)), 
+                 model_code = stan_nlin_model3,refresh=0)
+
+monitor(fit_nlin3, probs = c(0.1, 0.5, 0.9))
+```
+
+# Convergence diagnostics
+## $\hat{R}$ values
+ALL obtained $\hat{R}$ values are rather close to 1. $\hat{R}$ is the potential scale reduction factor on split chains (at convergence, $\hat{R}$=1). At convergence, the chains will have mixed, so that the distribution of the simulations between and within chains will be identical, and the ratio $\hat{R}$ should equal 1. In practice the error less than 0.01 is acceptable so that we can say chains probably converged and estimates reliable.
+
+## ESS diagnostics
+Also we make a discussion about effective sample size(ESS) values. The effective sample size (ESS) of a quantity of interest captures how many independent draws contain the same amount of information as the dependent sample obtained by the MCMC algorithm. From above monitor summary, the obtained Bulk_ESS and Tail_ESS are crude measures of effective sample size for bulk and tail quantities respectively (an $ESS > 100$ per chain is considered good). We can easily give a conclusion that the MCMC algorithm operated properly since the ESS values are much larger than 100.
+
+## HMC diagnostics
+```{r}
+print("separate-hp")
+check_hmc_diagnostics(fit_hp)
+print("separate-wt")
+check_hmc_diagnostics(fit_wt)
+print("separate-vs")
+check_hmc_diagnostics(fit_vs)
+print("separate-am")
+check_hmc_diagnostics(fit_am)
+print("separate-crab")
+check_hmc_diagnostics(fit_carb)
+print("separate-lphkm")
+check_hmc_diagnostics(fit_lphkm)
+print("separate-cyl")
+check_hmc_diagnostics(fit_cyl)
+print("separate-disp")
+check_hmc_diagnostics(fit_disp)
+print("separate-gear")
+check_hmc_diagnostics(fit_gear)
+print("separate-drat")
+check_hmc_diagnostics(fit_drat)
+print("multivariate1")
+check_hmc_diagnostics(fit_nlin1)
+print("multivariate2")
+check_hmc_diagnostics(fit_nlin2)
+print("multivariate3")
+check_hmc_diagnostics(fit_nlin3)
+```
+
+From the above results we can know that the adaptation phase of the Markov Chains did turn out well and those chains likely did explore the posterior distribution efficiently.
+
+# Posterior checking
+```{r}
+plot_dfa <- data.frame(qsec = c(c(extract(fit_hp, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_wt, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_vs, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_am, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_carb, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_lphkm, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_cyl, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_disp, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_drat, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_gear, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlin1, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlin2, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlin3, pars = 'alpha', permuted = TRUE)$alpha)),
+                      Distribution =rep(c("separate-hp","separate-wt","separate-vs",
+                                          "separate-am","separate-crab",
+                                          "separate-lphkm","separate-cyl",
+                                          "separate-disp","separate-gear",
+                                          "separate-drat","multivariate1",
+                                          "multivariate2","multivariate3"),
+                                         times=c(128000,128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,128000,128000)))
+ggplot(plot_dfa, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1")  +
+  ggtitle("alpha distribution") +
+  theme_bw()
+
+plot_dfb1 <- data.frame(qsec = c(c(extract(fit_hp, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_wt, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_vs, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_am, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_carb, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_lphkm, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_cyl, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_disp, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_drat, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_gear, pars = 'beta', permuted = TRUE)$beta),
+                               c(extract(fit_nlin1, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+                               c(extract(fit_nlin1, pars = 'beta_hp', permuted = TRUE)$beta_hp),
+                               c(extract(fit_nlin1, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+                               c(extract(fit_nlin1, pars = 'beta_am', permuted = TRUE)$beta_am),
+                               c(extract(fit_nlin1, pars = 'beta_carb', permuted = TRUE)$beta_carb)),
+                      Distribution = rep(c("separate-hp","separate-wt",
+                                           "separate-vs","separate-am",
+                                           "separate-crab","separate-lphkm",
+                                           "separate-cyl","separate-disp",
+                                           "separate-gear","separate-drat",
+                                          "multivariate1-wt","multivariate1-hp",
+                                           "multivariate1-vs","multivariate1-am",
+                                          "multivariate1-carb"),
+                                         times=c(128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000)))
+ggplot(plot_dfb1, aes(qsec, color = Distribution)) +
+  geom_density() +
+  ggtitle("beta distribution") +
+  theme_bw()+
+  xlim(-2, 2)
+
+plot_dfb2 <- data.frame(qsec = c(c(extract(fit_nlin2, pars = 'beta_disp', permuted = TRUE)$beta_disp),
+                               c(extract(fit_nlin2, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+                               c(extract(fit_nlin2, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+                               c(extract(fit_nlin2, pars = 'beta_carb', permuted = TRUE)$beta_carb),
+                               c(extract(fit_nlin3, pars = 'beta_lphkm', permuted = TRUE)$beta_lphkm),
+                               c(extract(fit_nlin3, pars = 'beta_cyl', permuted = TRUE)$beta_cyl),
+                               c(extract(fit_nlin3, pars = 'beta_disp', permuted = TRUE)$beta_disp),
+                               c(extract(fit_nlin3, pars = 'beta_drat', permuted = TRUE)$beta_drat),
+                               c(extract(fit_nlin3, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+                               c(extract(fit_nlin3, pars = 'beta_hp', permuted = TRUE)$beta_hp),
+                               c(extract(fit_nlin3, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+                               c(extract(fit_nlin3, pars = 'beta_am', permuted = TRUE)$beta_am),
+                               c(extract(fit_nlin3, pars = 'beta_gear', permuted = TRUE)$beta_gear),
+                               c(extract(fit_nlin3, pars = 'beta_carb', permuted = TRUE)$beta_carb)),
+                      Distribution = rep(c("multivariate2-disp",
+                                           "multivariate2-wt","multivariate2-vs",
+                                "multivariate2-carb","multivariate3-lphkm",
+                                "multivariate3-cyl","multivariate3-disp",
+                              "multivariate3-drat","multivariate3-wt",
+                              "multivariate3-hp","multivariate3-vs",
+                              "multivariate3-am","multivariate3-gear",
+                              "multivariate3-carb"),
+                                         times=c(128000,128000,128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,128000,128000)))
+ggplot(plot_dfb2, aes(qsec, color = Distribution)) +
+  geom_density() +
+  ggtitle("beta distribution") +
+  theme_bw() +
+  xlim(-2, 2)
+
+plot_dfs <- data.frame(qsec = c(c(extract(fit_hp, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_wt, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_vs, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_am, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_carb, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_lphkm, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_cyl, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_disp, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_drat, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_gear, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_nlin1, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_nlin2, pars = 'sigma', permuted = TRUE)$sigma),
+                               c(extract(fit_nlin3, pars = 'sigma', permuted = TRUE)$sigma)),
+                      Distribution = rep(c("separate-hp","separate-wt",
+                                           "separate-vs",
+                                          "separate-am","separate-crab",
+                                          "separate-lphkm","separate-cyl",
+                                          "separate-disp","separate-gear",
+                                          "separate-drat","multivariate1",
+                                          "multivariate2","multivariate3"),
+                                         times=c(128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,
+                                                 128000,128000,128000)))
+ggplot(plot_dfs, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  ggtitle("sigma distribution") +
+  theme_bw()
+```
+
+We sample and obtain posterior distributions for the parameters in the models. The posterior predictive distributions for Quarter mile time (how fast the car can traverse a quarter mile) the by various models are shown above. 
+
+$\alpha$ is the intercept term of the linear function and it ensures that the model will be unbiased--i.e., the mean of the residuals will be exactly zero. $\alpha$ also represents the Y-intercept of the regression line. We can notice that all models give the quiet similar distribution and present that the mean is close to zero. 
+
+$\sigma$ is the variance (squared scale) of the estimation and it will affect the shape of the final normal distribution. The $\sigma$ predictive distributions above follow the same trend and have the close peak position. Consequently, the shape of qsec predictive distributions won't affect by the variance parameter.
+
+The interpretation of $\beta$ is the expected change in qsec for a one-unit change in corresponding parameter when the other covariates are held fixed. We can find that the parameters from multivariate model 1 share the similar change performance with the univariate model. In addition, the shape of $\beta$ predictive distributions from multivariate model 2 and multivariate model follow the same trend. It is possible that the best subset selected by the \textit{regsubsets} function is significant.
+
+# Performance analysis 
+```{r}
+log_lik_hp <- extract_log_lik(fit_hp, merge_chains = FALSE)
+loo_hp<-loo(log_lik_hp, r_eff = relative_eff(exp(log_lik_hp)))
+log_lik_wt <- extract_log_lik(fit_wt, merge_chains = FALSE)
+loo_wt<-loo(log_lik_wt, r_eff = relative_eff(exp(log_lik_wt)))
+log_lik_vs <- extract_log_lik(fit_vs, merge_chains = FALSE)
+loo_vs<-loo(log_lik_vs, r_eff = relative_eff(exp(log_lik_vs)))
+log_lik_am <- extract_log_lik(fit_am, merge_chains = FALSE)
+loo_am<-loo(log_lik_am, r_eff = relative_eff(exp(log_lik_am)))
+log_lik_carb <- extract_log_lik(fit_carb, merge_chains = FALSE)
+loo_carb<-loo(log_lik_carb, r_eff = relative_eff(exp(log_lik_carb)))
+log_lik_lphkm <- extract_log_lik(fit_lphkm, merge_chains = FALSE)
+loo_lphkm<-loo(log_lik_lphkm, r_eff = relative_eff(exp(log_lik_lphkm)))
+log_lik_cyl <- extract_log_lik(fit_cyl, merge_chains = FALSE)
+loo_cyl<-loo(log_lik_cyl, r_eff = relative_eff(exp(log_lik_cyl)))
+log_lik_disp <- extract_log_lik(fit_disp, merge_chains = FALSE)
+loo_disp<-loo(log_lik_disp, r_eff = relative_eff(exp(log_lik_disp)))
+log_lik_gear <- extract_log_lik(fit_gear, merge_chains = FALSE)
+loo_gear<-loo(log_lik_gear, r_eff = relative_eff(exp(log_lik_gear)))
+log_lik_drat <- extract_log_lik(fit_drat, merge_chains = FALSE)
+loo_drat<-loo(log_lik_drat, r_eff = relative_eff(exp(log_lik_drat)))
+log_lik_nlin1 <- extract_log_lik(fit_nlin1, merge_chains = FALSE)
+loo_nlin1<-loo(log_lik_nlin1, r_eff = relative_eff(exp(log_lik_nlin1)))
+log_lik_nlin2 <- extract_log_lik(fit_nlin2, merge_chains = FALSE)
+loo_nlin2<-loo(log_lik_nlin2, r_eff = relative_eff(exp(log_lik_nlin2)))
+log_lik_nlin3 <- extract_log_lik(fit_nlin3, merge_chains = FALSE)
+loo_nlin3<-loo(log_lik_nlin3, r_eff = relative_eff(exp(log_lik_nlin3)))
+
+kv <- data.frame(k = loo_hp$diagnostics$pareto_k,
+                      x = 1:length(loo_hp$diagnostics$pareto_k))
+p1<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-hp") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_wt$diagnostics$pareto_k,
+                      x = 1:length(loo_wt$diagnostics$pareto_k))
+p2<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-wt") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+
+kv <- data.frame(k = loo_vs$diagnostics$pareto_k,
+                      x = 1:length(loo_vs$diagnostics$pareto_k))
+p3<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-vs") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_am$diagnostics$pareto_k,
+                      x = 1:length(loo_am$diagnostics$pareto_k))
+p4<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-am") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_carb$diagnostics$pareto_k,
+                      x = 1:length(loo_carb$diagnostics$pareto_k))
+p5<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-carb") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+kv <- data.frame(k = loo_lphkm$diagnostics$pareto_k,
+                      x = 1:length(loo_lphkm$diagnostics$pareto_k))
+p6<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-lphkm") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_cyl$diagnostics$pareto_k,
+                      x = 1:length(loo_cyl$diagnostics$pareto_k))
+p7<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-cyl") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+
+kv <- data.frame(k = loo_disp$diagnostics$pareto_k,
+                      x = 1:length(loo_disp$diagnostics$pareto_k))
+p8<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-disp") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_gear$diagnostics$pareto_k,
+                      x = 1:length(loo_gear$diagnostics$pareto_k))
+p9<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-gear") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_drat$diagnostics$pareto_k,
+                      x = 1:length(loo_drat$diagnostics$pareto_k))
+p10<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("separate-drat") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_nlin1$diagnostics$pareto_k,
+                      x = 1:length(loo_nlin1$diagnostics$pareto_k))
+p11<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("multivariate1") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_nlin2$diagnostics$pareto_k,
+                      x = 1:length(loo_nlin2$diagnostics$pareto_k))
+p12<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("multivariate2") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+kv <- data.frame(k = loo_nlin3$diagnostics$pareto_k,
+                      x = 1:length(loo_nlin3$diagnostics$pareto_k))
+p13<-ggplot(data=kv, aes(x=x, y=k)) +
+    geom_point(color = 'red') +
+    geom_hline(yintercept=0.7, color = 'blue') +
+    ggtitle("multivariate3") +
+    xlab("") +
+    ylab("k-value") +
+    theme_bw()
+
+grid.arrange(p1, p2, p3, p4,p5,p6,p7,p8,p9,p10,p11,p12,p13)
+
+(df<-data.frame("model"=c("separate-hp","separate-wt",
+                          "separate-vs",
+                          "separate-am","separate-crab",
+                          "separate-lphkm",
+                          "separate-cyl","separate-disp",
+                          "separate-gear",
+                          "separate-drat","multivariate1", 
+                          "multivariate2", "multivariate3"),
+                "PSIS_LOO"=c(loo_hp$estimates[1],loo_wt$estimates[1],loo_vs$estimates[1],
+                  loo_am$estimates[1],loo_carb$estimates[1],loo_lphkm$estimates[1],
+                  loo_cyl$estimates[1],loo_disp$estimates[1],loo_gear$estimates[1],
+                  loo_drat$estimates[1],loo_nlin1$estimates[1],loo_nlin2$estimates[1],loo_nlin3$estimates[1]),
+                "p_eff"=c(loo_hp$estimates[2],loo_wt$estimates[2],loo_vs$estimates[2],
+                  loo_am$estimates[2],loo_carb$estimates[2],loo_lphkm$estimates[2],
+                  loo_cyl$estimates[2],loo_disp$estimates[2],loo_gear$estimates[2],
+                  loo_drat$estimates[2],loo_nlin1$estimates[2],loo_nlin2$estimates[2],loo_nlin3$estimates[2])))
+
+```
+
+We use leave-one-out cross validation (LOO-cv) to compare the performance of the models. With a few exceptions, most of the k-values seem to be lower than 0.7 so that we can trust the results. 
+Next, let's look at the PSIS-LOO values. The higher the value, the better the performance of the model. The multivariate model 2 has highest PSIS-LOO value and shows better performance than multivariate model 1, multivariate model 3 or any other single-variable model. It seems that we need to trust the computer rather than our prior world information.
+
+# Model performance assessment
+
+```{r}
+plot_df <- data.frame(qsec = c(c(extract(fit_hp, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_wt, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_vs, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_am, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_carb, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_lphkm, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_cyl, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_disp, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_drat, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_gear, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlin1, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlin2, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlin3, pars = 'mu', permuted = TRUE)$mu),
+                                  scaled_car_properties$qsec),
+                      Distribution = rep(c("separate-hp","separate-wt",
+                                           "separate-vs","separate-am",
+                                           "separate-crab","separate-lphkm",
+                                           "separate-cyl","separate-disp",
+                                           "separate-gear","separate-drat",
+                                           "multivariate1",
+                                           "multivariate2","multivariate3" ,
+                                           "Original"),
+                                         times=c(128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,
+                                                 128000, 128000,128000,nrow(scaled_car_properties))))
+ggplot(plot_df, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  theme_bw()
+```
+The predictive distributions are plotted above. The multivariate models's distribution is very close to the original one while the other single variable models change the peak of the density from the original one.
+
+```{r}
+hp_lin<-c(mean(extract(fit_hp, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_hp, pars = 'beta', permuted = TRUE)$beta))
+vs_lin<-c(mean(extract(fit_vs, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_vs, pars = 'beta', permuted = TRUE)$beta))
+wt_lin<-c(mean(extract(fit_wt, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_wt, pars = 'beta', permuted = TRUE)$beta))
+am_lin<-c(mean(extract(fit_am, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_am, pars = 'beta', permuted = TRUE)$beta))
+carb_lin<-c(mean(extract(fit_carb, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_carb, pars = 'beta', permuted = TRUE)$beta))
+lphkm_lin<-c(mean(extract(fit_lphkm, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_lphkm, pars = 'beta', permuted = TRUE)$beta))
+cyl_lin<-c(mean(extract(fit_cyl, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_cyl, pars = 'beta', permuted = TRUE)$beta))
+disp_lin<-c(mean(extract(fit_disp, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_disp, pars = 'beta', permuted = TRUE)$beta))
+gear_lin<-c(mean(extract(fit_gear, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_gear, pars = 'beta', permuted = TRUE)$beta))
+drat_lin<-c(mean(extract(fit_drat, pars = 'alpha', permuted = TRUE)$alpha),
+          mean(extract(fit_drat, pars = 'beta', permuted = TRUE)$beta))
+n_lin1<-c(mean(extract(fit_nlin1, pars = 'alpha', permuted = TRUE)$alpha),
+         mean(extract(fit_nlin1, pars = 'beta_hp', permuted = TRUE)$beta_hp),
+         mean(extract(fit_nlin1, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+         mean(extract(fit_nlin1, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+         mean(extract(fit_nlin1, pars = 'beta_am', permuted = TRUE)$beta_am),
+          mean(extract(fit_nlin1, pars = 'beta_carb', permuted = TRUE)$beta_carb))
+n_lin2<-c(mean(extract(fit_nlin2, pars = 'alpha', permuted = TRUE)$alpha),
+         mean(extract(fit_nlin2, pars = 'beta_disp ', permuted = TRUE)$beta_disp),
+         mean(extract(fit_nlin2, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+         mean(extract(fit_nlin2, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+         mean(extract(fit_nlin2, pars = 'beta_carb ', permuted = TRUE)$beta_carb))
+n_lin3<-c(mean(extract(fit_nlin3, pars = 'alpha', permuted = TRUE)$alpha),
+         mean(extract(fit_nlin3, pars = 'beta_lphkm', permuted = TRUE)$beta_lphkm),
+         mean(extract(fit_nlin3, pars = 'beta_cyl', permuted = TRUE)$beta_cyl),
+         mean(extract(fit_nlin3, pars = 'beta_disp', permuted = TRUE)$beta_disp),
+         mean(extract(fit_nlin3, pars = 'beta_hp', permuted = TRUE)$beta_hp),
+         mean(extract(fit_nlin3, pars = 'beta_drat', permuted = TRUE)$beta_drat),
+         mean(extract(fit_nlin3, pars = 'beta_wt', permuted = TRUE)$beta_wt),
+         mean(extract(fit_nlin3, pars = 'beta_vs', permuted = TRUE)$beta_vs),
+         mean(extract(fit_nlin3, pars = 'beta_am', permuted = TRUE)$beta_am),
+         mean(extract(fit_nlin3, pars = 'beta_gear', permuted = TRUE)$beta_gear),
+          mean(extract(fit_nlin3, pars = 'beta_carb', permuted = TRUE)$beta_carb))
+
+(res_df<-data.frame("separate-hp"=c(scaled_car_properties$qsec- 
+                                      hp_lin[1]+hp_lin[2]*scaled_car_properties$hp),
+               "separate-wt"=c(scaled_car_properties$qsec- 
+                                 wt_lin[1]+wt_lin[2]*scaled_car_properties$wt),
+               "separate-vs"=c(scaled_car_properties$qsec- 
+                                 vs_lin[1]+vs_lin[2]*scaled_car_properties$vs),
+               "separate-am"=c(scaled_car_properties$qsec- 
+                                 am_lin[1]+am_lin[2]*scaled_car_properties$am),
+               "separate-carb"=c(scaled_car_properties$qsec- 
+                                   carb_lin[1]+carb_lin[2]*scaled_car_properties$carb),
+               "separate-lphkm"=c(scaled_car_properties$qsec-
+                                    lphkm_lin[1]+lphkm_lin[2]*scaled_car_properties$lphkm),
+               "separate-cyl"=c(scaled_car_properties$qsec- 
+                                  cyl_lin[1]+cyl_lin[2]*scaled_car_properties$cyl),
+               "separate-disp"=c(scaled_car_properties$qsec- 
+                                   disp_lin[1]+disp_lin[2]*scaled_car_properties$disp),
+               "separate-gear"=c(scaled_car_properties$qsec- 
+                                   gear_lin[1]+gear_lin[2]*scaled_car_properties$gear),
+               "separate-drat"=c(scaled_car_properties$qsec- 
+                                   drat_lin[1]+drat_lin[2]*scaled_car_properties$drat),
+               "multivariate1"=c(scaled_car_properties$qsec- 
+                                   (n_lin1[1]+n_lin1[2]*scaled_car_properties$hp+
+                 n_lin1[3]*scaled_car_properties$wt+n_lin1[4]*scaled_car_properties$vs+
+                 n_lin1[5]*scaled_car_properties$am+n_lin1[6]*scaled_car_properties$carb)),
+               "multivariate2"=c(scaled_car_properties$qsec- 
+                                   (n_lin2[1]+n_lin2[2]*scaled_car_properties$disp+
+                 n_lin2[3]*scaled_car_properties$wt+n_lin2[4]*scaled_car_properties$vs+
+                 n_lin2[5]*scaled_car_properties$carb)),
+               "multivariate3"=c(scaled_car_properties$qsec- 
+                                   (n_lin3[1]+n_lin3[2]*scaled_car_properties$lphkm+
+                 n_lin3[3]*scaled_car_properties$cyl+n_lin3[4]*scaled_car_properties$disp+
+                 n_lin3[5]*scaled_car_properties$hp+n_lin3[6]*scaled_car_properties$drat+
+                 n_lin3[7]*scaled_car_properties$wt+n_lin3[8]*scaled_car_properties$vs+
+                   n_lin3[9]*scaled_car_properties$am+n_lin3[10]*scaled_car_properties$gear+
+                   n_lin3[11]*scaled_car_properties$carb))))
+(res_mean<-data.frame("model"=c("separate-hp","separate-wt","separate-vs","separate-am",
+                              "separate-crab","separate-lphkm","separate-cyl","separate-disp",
+                              "separate-gear","separate-drat","multivariate1",
+                              "multivariate2","multivariate3"),
+                  "mean.res"=c(mean(t(res_df["separate.hp"])),mean(t(res_df["separate.wt"])),
+                              mean(t(res_df["separate.vs"])),mean(t(res_df["separate.am"])),
+                              mean(t(res_df["separate.carb"])),mean(t(res_df["separate.lphkm"])),
+                              mean(t(res_df["separate.cyl"])),mean(t(res_df["separate.disp"])),
+                              mean(t(res_df["separate.gear"])),mean(t(res_df["separate.drat"])),
+                              mean(t(res_df["multivariate1"])),mean(t(res_df["multivariate2"])),
+                              mean(t(res_df["multivariate3"])))))
+plot(1:32,t(res_df["separate.hp"]),type="p",pch="o",col="red",
+     lty=1,ylab="residual",xlab="qsec",ylim=c(-5,7))
+lines(1:32,t(res_df["separate.wt"]), type ="o",lty=2,col="blue",pch="*")
+lines(1:32,t(res_df["separate.vs"]), type ="o",lty=3,col="dark green",pch="+")
+lines(1:32,t(res_df["separate.am"]), type ="o",lty=4,col="yellow",pch="o")
+lines(1:32,t(res_df["separate.carb"]), type ="o",lty=5,col="orange",pch="+")
+lines(1:32,t(res_df["separate.lphkm"]), type ="o",lty=6,col="deeppink",pch="*")
+lines(1:32,t(res_df["separate.cyl"]), type ="o",lty=7,col="gray",pch="+")
+lines(1:32,t(res_df["separate.disp"]), type ="o",lty=8,col="hotpink",pch="o")
+lines(1:32,t(res_df["separate.gear"]), type ="o",lty=9,col="lightgoldenrod",pch="+")
+lines(1:32,t(res_df["separate.drat"]), type ="o",lty=10,col="olivedrab",pch="o")
+lines(1:32,t(res_df["multivariate1"]), type ="o",lty=11,col="purple",pch="*")
+lines(1:32,t(res_df["multivariate2"]), type ="o",lty=12,col="chocolate",pch="+")
+lines(1:32,t(res_df["multivariate3"]), type ="o",lty=13,col="cyan",pch="o")
+lines(1:32,rep(0,32), type ="l",pch="-",col="grey")
+legend("topright",legend=c("sep.hp", "sep.wt", "sep.vs",
+                           "sep.am","sep.carb","sep.lphkm", "sep.cyl", "sep.disp","sep.gear","sep.drat","multi1","multi2","multi3"),
+       col=c("red", "blue", "dark green","yellow","orange","deeppink","gray","hotpink",
+             "lightgoldenrod","olivedrab","purple","chocolate","cyan"),
+       pch=c("o","*","+","o","+","*","+","o","+","o","*","+","o"),
+       lty=c(1,2,3,4,5,6,7,8,9,10,11,12,13))
+```
+
+As we can see, the mean residuals of different models are rather close to 0. If we look at each residual value, we can find that some of them are quiet large and can approximately reach 4. Different models share the same residual pattern.    
+In addition, single-variate models has mean residuals of the order of $10^{-3}$, while multivariate models achieve better results than it. One thing worth noting is that multivariate model 1 this time is better than multivariate model 2. The possible explanation is that a linear relationship may not be entirely suitable for describing our target parameters. Some correlations can help improve model performance.
+
+## Statistical inference 
+Use multivariate model to check human readable real world statistics dependency.
+```{r}
+sds <- sapply(car_properties[c("wt", "hp","vs","am","carb", "qsec")], sd)
+
+beta_smry <- summary(fit_nlin1, pars = c("beta_wt", "beta_hp",
+                                         "beta_vs","beta_am","beta_carb"))$summary
+orig_smry <- beta_smry[, c(1, 4:8)]
+orig_smry[1,] <- orig_smry[1,]/sds["wt"] * sds["qsec"]
+orig_smry[2,] <- orig_smry[2,]/sds["hp"] * sds["qsec"]
+orig_smry[3,] <- orig_smry[3,]/sds["vs"] * sds["qsec"]
+orig_smry[4,] <- orig_smry[4,]/sds["am"] * sds["qsec"]
+orig_smry[5,] <- orig_smry[5,]/sds["carb"] * sds["qsec"]
+knitr::kable(orig_smry, digits = 3)
+```
+
+```{r}
+sds <- sapply(car_properties[c("disp", "wt","vs","carb", "qsec")], sd)
+
+beta_smry <- summary(fit_nlin2, pars = c("beta_disp", 
+                                         "beta_wt","beta_vs","beta_carb"))$summary
+orig_smry <- beta_smry[, c(1, 4:8)]
+orig_smry[1,] <- orig_smry[1,]/sds["disp"] * sds["qsec"]
+orig_smry[2,] <- orig_smry[2,]/sds["wt"] * sds["qsec"]
+orig_smry[3,] <- orig_smry[3,]/sds["vs"] * sds["qsec"]
+orig_smry[4,] <- orig_smry[4,]/sds["carb"] * sds["qsec"]
+knitr::kable(orig_smry, digits = 3)
+```
+
+```{r}
+sds <- sapply(car_properties[c("lphkm", "cyl","disp","hp","drat",
+                               "wt", "vs", "am", "gear", "carb","qsec")], sd)
+
+beta_smry <- summary(fit_nlin3, pars = c("beta_lphkm", "beta_cyl","beta_disp",
+                                         "beta_hp","beta_drat","beta_wt",
+                                         "beta_vs","beta_am","beta_gear","beta_carb"))$summary
+orig_smry <- beta_smry[, c(1, 4:8)]
+orig_smry[1,] <- orig_smry[1,]/sds["lphkm"] * sds["qsec"]
+orig_smry[2,] <- orig_smry[2,]/sds["cyl"] * sds["qsec"]
+orig_smry[3,] <- orig_smry[3,]/sds["disp"] * sds["qsec"]
+orig_smry[4,] <- orig_smry[4,]/sds["hp"] * sds["qsec"]
+orig_smry[5,] <- orig_smry[5,]/sds["drat"] * sds["qsec"]
+orig_smry[6,] <- orig_smry[6,]/sds["wt"] * sds["qsec"]
+orig_smry[7,] <- orig_smry[7,]/sds["vs"] * sds["qsec"]
+orig_smry[8,] <- orig_smry[8,]/sds["am"] * sds["qsec"]
+orig_smry[9,] <- orig_smry[9,]/sds["gear"] * sds["qsec"]
+orig_smry[10,] <- orig_smry[10,]/sds["carb"] * sds["qsec"]
+knitr::kable(orig_smry, digits = 3)
+```
+
+
+For the regression coefficients, some are positive with a rather large impact but still some are negative with smaller impact.Based on these three results, we would say that shape of the engine(straight vs V-shaped) and the weight parameter give much more support for cars traversing a quarter mile.
+
+# Sensitive analysis
+Let's check how much the results would change if we used a different set of priors.The examine is done with default noninformative priors of Stan.
+```{r}
+stan_separate_model_de = '
+data {
+  int<lower=0> N; 
+  vector[N] x;
+  vector[N] y; 
+}
+parameters {
+  real alpha;           
+  real beta;            
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[N] mu;
+  mu = alpha + beta*x;
+}
+model {
+  y ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[N] log_lik;
+  for (i in 1:N)
+    log_lik[i] = normal_lpdf(y[i] |alpha+x[i]*beta , sigma);
+}
+'
+
+fit_hpd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$hp),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_wtd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$wt),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_vsd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$vs),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_amd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$am),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_carbd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$carb),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_lphkmd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$lphkm),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_cyld = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$cyl),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_dispd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$disp),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_geard = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$gear),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+fit_dratd = stan(data = list(N=length(scaled_car_properties$qsec),
+                   x=c(scaled_car_properties$drat),
+                   y=c(scaled_car_properties$qsec)),
+                    model_code = stan_separate_model_de,refresh=0)
+
+stan_nlind_model1 = '
+data {
+  int<lower=0> n; 
+  vector[n] hp;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] am;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_hp;
+  real beta_wt;
+  real beta_vs;
+  real beta_am;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_hp*hp + beta_wt*wt + beta_vs*vs + 
+       beta_am*am + beta_carb*carb;
+}
+model {
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlind1 = stan(data = list(n=length(scaled_car_properties$hp),
+                 hp=c(scaled_car_properties$hp),
+                 wt=c(scaled_car_properties$wt),
+                 vs=c(scaled_car_properties$vs),
+                 am=c(scaled_car_properties$am),
+                 carb=c(scaled_car_properties$carb),
+                 qsec=c(scaled_car_properties$qsec)), 
+                  model_code = stan_nlind_model1,refresh=0)
+
+stan_nlind_model2 = '
+data {
+  int<lower=0> n; 
+  vector[n] disp;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_disp;
+  real beta_wt;
+  real beta_vs;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_disp*disp + beta_wt*wt + beta_vs*vs + beta_carb*carb;
+}
+model {
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlind2 = stan(data = list(n=length(scaled_car_properties$hp),
+                 disp=c(scaled_car_properties$disp),
+                 wt=c(scaled_car_properties$wt),
+                 vs=c(scaled_car_properties$vs),
+                 carb=c(scaled_car_properties$carb),
+                 qsec=c(scaled_car_properties$qsec)), 
+                  model_code = stan_nlind_model2,refresh=0)
+
+stan_nlind_model3 = '
+data {
+  int<lower=0> n; 
+  vector[n] lphkm;
+  vector[n] cyl;
+  vector[n] disp;
+  vector[n] hp;
+  vector[n] drat;
+  vector[n] wt;
+  vector[n] vs;
+  vector[n] am;
+  vector[n] gear;
+  vector[n] carb;
+  vector[n] qsec;
+}
+parameters {
+  real alpha;
+  real beta_lphkm;
+  real beta_cyl;
+  real beta_disp;
+  real beta_hp;
+  real beta_drat;
+  real beta_wt;
+  real beta_vs;
+  real beta_am;
+  real beta_gear;
+  real beta_carb;
+  real<lower=0> sigma;
+}
+transformed parameters{
+  vector[n] mu;
+  mu = alpha + beta_lphkm*lphkm + beta_cyl* cyl + 
+  beta_disp * disp + beta_hp*hp + beta_drat* drat + beta_wt*wt + 
+  beta_vs*vs + beta_am*am + beta_gear*gear + beta_carb*carb;
+}
+model {
+  qsec ~ normal(mu, sigma);
+}
+// Log likelihoods genereated for LOO
+generated quantities {
+  vector[n] log_lik;
+  for (i in 1:n)
+    log_lik[i] = normal_lpdf(qsec[i] |mu[i] , sigma);
+}
+'
+
+fit_nlind3 = stan(data = list(n=length(scaled_car_properties$hp),
+                             lphkm=c(scaled_car_properties$lphkm),
+                             cyl=c(scaled_car_properties$cyl),
+                             disp=c(scaled_car_properties$disp),
+                             hp=c(scaled_car_properties$hp),
+                             drat=c(scaled_car_properties$drat),
+                             wt=c(scaled_car_properties$wt),
+                             vs=c(scaled_car_properties$vs),
+                             am=c(scaled_car_properties$am),
+                             gear=c(scaled_car_properties$gear),
+                             carb=c(scaled_car_properties$carb),
+                             qsec=c(scaled_car_properties$qsec)), 
+                 model_code = stan_nlind_model3,refresh=0)
+
+```
+
+```{r}
+p1<-ggplot(plot_dfa, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  theme_bw()
+plot_dfad <- data.frame(qsec = c(c(extract(fit_hpd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_wtd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_vsd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_amd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_carbd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_lphkmd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_cyld, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_dispd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_geard, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_dratd, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlind1, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlind2, pars = 'alpha', permuted = TRUE)$alpha),
+                               c(extract(fit_nlind3, pars = 'alpha', permuted = TRUE)$alpha)),
+                      Distribution = rep(c("separate-hp","separate-wt",
+                                           "separate-vs",
+                                          "separate-am","separate-carb",
+                                          "separate-lphkm",
+                                          "separate-cyl","separate-disp",
+                                          "separate-gear","separate-drat"
+                                           ,"multivariate1","multivariate2",
+                                          "multivariate3"),
+                                         times=c(128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,
+                                                 128000,128000,128000)))
+p2<-ggplot(plot_dfad, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  theme_bw()
+grid.arrange(p1, p2)
+
+
+plot_dfd <- data.frame(qsec = c(c(extract(fit_hpd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_wtd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_vsd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_amd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_carbd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_lphkmd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_cyld, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_dispd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_geard, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_dratd, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlind1, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlind2, pars = 'mu', permuted = TRUE)$mu),
+                               c(extract(fit_nlind3, pars = 'mu', permuted = TRUE)$mu),
+                                  scaled_car_properties$qsec),
+                      Distribution = rep(c("separate-hp-d","separate-wt-d",
+                                           "separate-vs-d",
+                                           "separate-am-d","separate-carb-d",
+                                           "separate-lphkm-d",
+                                           "separate-cyl-d","separate-disp-d",
+                                           "separate-gear-d",
+                                           "separate-drat-d","multivariate1-d",
+                                           "multivariate2-d",
+                                           "multivariate3-d", "Original"),
+                                         times=c(128000,128000,128000,128000,128000,
+                                                 128000,128000,128000,128000,128000,
+                                                 128000,128000,128000, nrow(scaled_car_properties))))
+p1<-ggplot(plot_df, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  theme_bw()
+p2<-ggplot(plot_dfd, aes(qsec, color = Distribution)) +
+  geom_density() +
+  #scale_color_brewer(palette = "Set1") +
+  theme_bw()
+grid.arrange(p1, p2)
+```
+
+Even though the priors have changed a lot, the distributions look very similar. We conclude that the posterior distribution is mainly determined by the data, and the effect of the priors is not obvious.
+
+# Conclusion
+We made a experiment based a dataset called Motor Trend Car Road Testson and studied how car design can affect the 1/4 mile time, in other words, the performance of the car. We proposed three different mutltivariate models to check the affect of common design parameter. Our model produces a credible posterior predictive distribution and is deemed usable as such. We cannot give a general conclusion that how to make better varivale selection but we can give a conclusion that the shape of the engine(straight vs V-shaped) and the weight parameter give much more support for cars traversing a quarter mile.  
+
+However, regarding the residuals, we found kind of pattern. For the future work, it is better to consider the non-linear relationshp. 
+
+# Acknowledge
+At first our main inspiration to explore linear regression model using $mtcars$ dataset stemmed from [1], but our following work are all done by ourselves.                                                                   
+
+# Reference
+[1] Anton Mattsson, bdacars, (2018), GitHub repository, https://github.com/antonvsdata/bdacars
+

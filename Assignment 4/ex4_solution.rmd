@@ -1,0 +1,199 @@
+---
+title: "BDA - Assignment 4"
+output: 
+  pdf_document: 
+    toc: yes
+    toc_depth: 3
+---
+
+
+```{r setup, include=FALSE}
+# This chunk just sets echo = TRUE as default (i.e. print all code)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r, echo=TRUE, include=FALSE}
+# To install aaltobda, see the General information in the assignment.
+library(aaltobda)
+library(mvtnorm)
+library(markmyassignment)
+library(ggplot2)
+#exercise_path <-
+#"https://github.com/avehtari/BDA_course_Aalto/blob/master/exercises/tests/ex4.yml"
+#set_assignment(exercise_path)
+#mark_my_assignment()
+```
+
+
+## Exercise 1. 
+### a)
+Provided that $corr(\alpha,\beta)=\frac{Covariance(\alpha,\beta)}{\sqrt{Variance(\alpha)Variance(\beta)}}$, the formula of the covariance matrix $$\left[\begin{matrix}
+ Cov(\alpha,\alpha)& Cov(\alpha,\beta)\\ 
+ Cov(\beta,\alpha)& Cov(\beta,\beta)
+\end{matrix}\right]$$ and also $Cov(\alpha,\alpha)=2^2, Cov(\beta,\beta)=10^2$, we can get \textbf{the mean and the covariance of the bivariate distribution} $$\mu=[0,10]$$ and $$\Sigma=\left[\begin{matrix}
+4& 10\\ 
+10& 100
+\end{matrix}\right]$$.
+
+### b)
+The code for the function that computes the logarithm of the density of the prior distribution in a) for arbitrary values of $\alpha$ and $\beta$ goes as follows.
+
+```{r}
+p_log_prior<-function(alpha, beta){
+return(log(dmvnorm(c(alpha,beta),c(0,10),matrix(c(4,10,10,100),ncol=2,nrow=2))))
+}
+```
+Also we can have a check here using the data from the instruction. The function should return a value very close to the correct answer.
+```{r}
+# have a test
+alpha <- 3
+beta <- 9
+cat("the correct answer is:  -6.296435 \n")
+cat("the calculated answer is: ",p_log_prior(alpha,beta),"\n")
+cat("the difference is",p_log_prior(alpha,beta)+6.296435,"\n")
+```
+
+
+### c)
+The code for the function that computes the logarithm of the density of the posterior for arbitrary values of $\alpha$ and $\beta$ goes as follows.
+```{r}
+data("bioassay")
+p_log_posterior<-function(alpha, beta){
+prior<-log(dmvnorm(c(alpha,beta),c(0,10),matrix(c(4,10,10,100),ncol=2,nrow=2)))
+likelihood<-bioassaylp(alpha,beta,bioassay$x,bioassay$y,bioassay$n)
+return(prior+likelihood)
+}
+```
+Also we can have a check here using the data from the instruction. The function should return a value very close to the correct answer.
+```{r}
+# have a test
+alpha <- 3
+beta <- 9
+cat("the correct answer is:  -15.78798 \n")
+cat("the calculated answer is: ",p_log_posterior(alpha,beta),"\n")
+cat("the difference is",p_log_posterior(alpha,beta)+15.78798,"\n")
+```
+
+### d)
+
+The figure is shown below.
+
+```{r}
+bioassay_posterior_density_plot(alpha_limits=c(-4,4),beta_limits = c(-10,30))
+```
+
+### e)
+
+The code for the functions that computes the importance ratios and the normalized weights for each sample goes as follows.
+
+```{r}
+log_importance_weights<-function(alpha, beta){
+likelihoods=c()
+for (i in seq(1,length(alpha),length=length(alpha)))
+{
+likelihoods=c(likelihoods,bioassaylp(alpha[i],beta[i],bioassay$x,bioassay$y,bioassay$n))
+}
+return(likelihoods)
+}
+
+normalized_importance_weights<-function(alpha, beta)
+{
+weights<-log_importance_weights(alpha,beta)
+weights<-exp(weights)
+nor_weights<-weights/sum(weights)
+return(nor_weights)
+}
+```
+Also we can have a check here using the data from the instruction. The function should return a value very close to the correct answer.
+```{r}
+#have a test
+alpha <- c(1.896, -3.6, 0.374, 0.964, -3.123, -1.581)
+beta <- c(24.76, 20.04, 6.15, 18.65, 8.16, 17.4)
+cat("Here's the test case:")
+cat("the correct answer for the log weights is: -8.95 -23.47 -6.02 -8.13 -16.61 -14.57 \n")
+cat("the calculated answer for the log weights is: ",round(log_importance_weights(alpha,beta),2),'\n')
+cat("the difference is ",mean(log_importance_weights(alpha,beta)-c(-8.95,-23.47,-6.02,-8.13,-16.61,-14.57)),'\n')
+cat("the correct answer for the normalized weights is:  0.045 0.000 0.852 0.103 0.000 0.000 \n")
+cat("the calculated answer for the normalized weights is: ",round(normalized_importance_weights(alpha,beta),3),'\n')
+cat("the difference is ",mean(normalized_importance_weights(alpha,beta)-c(0.045,0.000,0.852,0.103,0.000,0.000)),'\n')
+cat("test case ends")
+```
+Now that all the functions defined above work correctly. Now we can forget about the test case and draw some real samples from the prior.
+```{r}
+samples<-rmvnorm(10000,c(0,10),matrix(c(4,10,10,100),ncol=2,nrow=2))   #draw some samples
+alpha_samples<-samples[,1]
+beta_samples<-samples[,2]
+cat("real case:10000 samples drawn")
+```
+
+### f)
+
+```{r}
+posterior_mean<-function(alpha, beta)
+{
+weights<-normalized_importance_weights(alpha,beta)
+alpha_mean<-sum(weights*alpha)/sum(weights)
+beta_mean<-sum(weights*beta)/sum(weights)
+return(c(alpha_mean,beta_mean))
+}
+
+cat("the posterior mean using importance sampling and draws from e) is: ",
+    posterior_mean(alpha_samples,beta_samples))
+```
+
+
+### g)
+
+```{r}
+S_eff<-function(alpha, beta)
+{
+weights<-normalized_importance_weights(alpha,beta)
+return(1/sum(weights^2))
+}
+cat("the effective sample size is: ",S_eff(alpha_samples,beta_samples))
+```
+
+### h)
+
+The scatterplot of the obtained posterior sample is shown below.
+
+```{r}
+samples<-rmvnorm(10000,c(0,10),matrix(c(4,10,10,100),ncol=2,nrow=2))
+alpha<-samples[,1]
+beta<-samples[,2]
+weights<-normalized_importance_weights(alpha,beta)
+alpha_resample<-sample(alpha, 1000, replace = FALSE, prob = weights)
+beta_resample<-sample(beta, 1000, replace = FALSE, prob = weights)
+
+plot(alpha_resample,beta_resample,'p', xlab="Alpha Samples", ylab="Beta Samples",
+   main="Posterior Scatter Plot")
+```
+
+
+
+### i)
+
+```{r}
+cat("the estimate for p(beta > 0 | x,n,y) (probability that the drug is harmful)  is:",length(which(beta_resample>0))/length(beta_resample),"\n")
+```
+
+
+### j)
+The histogram of the draws from the posterior distribution of the LD50 conditional on Beta > 0 is shown below
+```{r}
+#delete points with beta<0
+alpha_resample_conditional<-c()
+beta_resample_conditional<-c()
+for (i in seq(1,1000,len=1000))
+{
+  if (beta_resample[i]>0)
+  {
+    alpha_resample_conditional<-c(alpha_resample_conditional,alpha_resample[i])
+    beta_resample_conditional<-c(beta_resample_conditional,beta_resample[i])
+  }
+}
+hist(-alpha_resample_conditional/beta_resample_conditional,xlab="LD50",main="histogram of LD50 conditional on Beta > 0")
+ggplot() + geom_histogram(aes(-alpha_resample_conditional/beta_resample_conditional))+
+  labs(title="histogram of LD50 conditional on Beta > 0",x="LD50", y = "Count")
+```
